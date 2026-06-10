@@ -15,6 +15,8 @@ class QDropApp {
     this._hasActiveTransfer = false;
     this._wakeLockListenerAdded = false;
     this._pendingRoomId = null;
+    this._focusHandler = null;
+    this._visibilityHandler = null;
   }
 
   start() {
@@ -243,7 +245,9 @@ class QDropApp {
         UIManager.showScreen('transfer-screen');
         UIManager.showNotification(`¡Conectado con ${peerUsername}!`, 'success');
         this.peerManager?.startKeepalive();
+        this.requestWakeLock(); // Mantener pantalla activa desde la conexión
         this.requestNotificationPermission();
+        this._setupConnectionKeepalive();
 
         const myNameLabel = document.getElementById('my-name-label');
         const peerNameLabel = document.getElementById('peer-name-label');
@@ -254,6 +258,7 @@ class QDropApp {
       onPeerDisconnected: () => {
         this.peerManager?.stopKeepalive();
         this.setTransferActive(false);
+        this._removeConnectionKeepalive();
         UIManager.showNotification('El otro usuario se desconectó. Volviendo al inicio...', 'info');
         setTimeout(() => {
           window.location.href = window.location.pathname;
@@ -410,9 +415,48 @@ class QDropApp {
     this._hasActiveTransfer = active;
     if (active) {
       this.requestWakeLock();
-    } else if (!this._isSending && !this.fileTransferManager.currentMeta) {
-      // Solo liberar si no hay transferencia activa en curso
-      this.releaseWakeLock();
+    }
+    // No liberar wake lock aquí — se libera al desconectar
+  }
+
+  /**
+   * Agrega handlers para mantener la conexión viva incluso cuando
+   * el usuario abre el selector de archivos (que puede backgroundear el tab).
+   */
+  _setupConnectionKeepalive() {
+    this._removeConnectionKeepalive();
+
+    this._focusHandler = () => {
+      if (!this.peerManager?.isConnected()) {
+        console.warn('[Keepalive] Conexión perdida al recuperar foco. Re-estableciendo...');
+        window.location.reload();
+      }
+    };
+
+    this._visibilityHandler = () => {
+      if (document.visibilityState === 'visible') {
+        // Enviar ráfaga de pings al volver para refrescar ICE
+        if (this.peerManager?.isConnected()) {
+          const conn = this.peerManager.getActiveConnection();
+          for (let i = 0; i < 3; i++) {
+            conn.send({ type: 'ping' });
+          }
+        }
+      }
+    };
+
+    window.addEventListener('focus', this._focusHandler);
+    document.addEventListener('visibilitychange', this._visibilityHandler);
+  }
+
+  _removeConnectionKeepalive() {
+    if (this._focusHandler) {
+      window.removeEventListener('focus', this._focusHandler);
+      this._focusHandler = null;
+    }
+    if (this._visibilityHandler) {
+      document.removeEventListener('visibilitychange', this._visibilityHandler);
+      this._visibilityHandler = null;
     }
   }
 

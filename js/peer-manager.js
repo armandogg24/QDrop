@@ -8,6 +8,7 @@ export class PeerManager {
     this.peerUsername = '';
     this._events = null;
     this._keepaliveInterval = null;
+    this._keepaliveWorker = null;
   }
 
   /**
@@ -206,23 +207,48 @@ export class PeerManager {
   }
 
   /**
-   * Inicia el envío periódico de pings para mantener la conexión ICE/STUN activa.
+   * Inicia el envío periódico de pings vía Web Worker.
+   * El Worker no es frenado por el navegador aunque el tab esté en segundo plano
+   * (ej. al abrir el selector de archivos en el celular).
    */
   startKeepalive() {
     this.stopKeepalive();
-    this._keepaliveInterval = setInterval(() => {
-      if (this.connection && this.connection.open) {
-        this.connection.send({ type: 'ping' });
-      } else {
-        this.stopKeepalive();
+
+    // Si el Worker ya existe, reciclarlo
+    if (!this._keepaliveWorker) {
+      try {
+        this._keepaliveWorker = new Worker('./js/keepalive-worker.js');
+        this._keepaliveWorker.onmessage = () => {
+          if (this.connection && this.connection.open) {
+            this.connection.send({ type: 'ping' });
+          } else {
+            this.stopKeepalive();
+          }
+        };
+      } catch (err) {
+        // Fallback a setInterval si no soporta Workers
+        console.warn('[Keepalive] Workers no soportado, usando setInterval:', err.message);
+        this._keepaliveInterval = setInterval(() => {
+          if (this.connection && this.connection.open) {
+            this.connection.send({ type: 'ping' });
+          } else {
+            this.stopKeepalive();
+          }
+        }, 5000);
+        return;
       }
-    }, 15000);
+    }
+
+    this._keepaliveWorker.postMessage({ type: 'start', interval: 5000 });
   }
 
   /**
    * Detiene los pings de keepalive.
    */
   stopKeepalive() {
+    if (this._keepaliveWorker) {
+      this._keepaliveWorker.postMessage({ type: 'stop' });
+    }
     if (this._keepaliveInterval) {
       clearInterval(this._keepaliveInterval);
       this._keepaliveInterval = null;
@@ -241,6 +267,10 @@ export class PeerManager {
     if (this.peer) {
       this.peer.destroy();
       this.peer = null;
+    }
+    if (this._keepaliveWorker) {
+      this._keepaliveWorker.terminate();
+      this._keepaliveWorker = null;
     }
   }
 }

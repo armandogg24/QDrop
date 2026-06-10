@@ -7,6 +7,7 @@ const ASSETS = [
   './js/peer-manager.js',
   './js/file-transfer.js',
   './js/ui-manager.js',
+  './js/keepalive-worker.js',
   './assets/icons/icon.svg',
   './manifest.json',
   'https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js',
