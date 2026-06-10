@@ -6,12 +6,17 @@ export class FileTransferManager {
 
   /**
    * Envía un archivo con chunks grandes y lectura eficiente en super-bloques.
-   * Los metadatos van por PeerJS, los chunks van por `peerConnection.send()`.
+   * Espera a que el buffer de envío se drene completamente antes de señalar
+   * el fin de archivo, y luego espera confirmación (ACK) del receptor.
+   *
+   * @param {File} file - Archivo a enviar
+   * @param {Object} peerConnection - Conexión PeerJS activa
+   * @param {Function} onProgress - Callback (bytesSent, totalBytes, speedMbps)
+   * @param {Function} waitForAck - Callback que retorna una Promise que se resuelve al recibir file-ack
    */
-  static async sendFile(file, peerConnection, onProgress) {
+  static async sendFile(file, peerConnection, onProgress, waitForAck) {
     const fileId = Math.random().toString(36).substring(2, 11);
 
-    // 1. Enviar metadatos del archivo como objeto (PeerJS lo serializa correctamente)
     peerConnection.send({
       type: 'file-meta',
       payload: {
@@ -23,7 +28,6 @@ export class FileTransferManager {
       }
     });
 
-    // Pausa mínima para que el receptor procese metadatos
     await new Promise(r => setTimeout(r, 10));
 
     let bytesSent = 0;
@@ -32,7 +36,6 @@ export class FileTransferManager {
     let fileOffset = 0;
 
     while (fileOffset < file.size) {
-      // Leer un super-bloque de 1MB del archivo (reduces FileReader calls 64x)
       const superSize = Math.min(this.SUPER_CHUNK_SIZE, file.size - fileOffset);
       const superBlob = file.slice(fileOffset, fileOffset + superSize);
       fileOffset += superSize;
@@ -44,10 +47,8 @@ export class FileTransferManager {
         reader.readAsArrayBuffer(superBlob);
       });
 
-      // Dividir el super-bloque en chunks de envío (sin más FileReader)
       let chunkOffset = 0;
       while (chunkOffset < superBuffer.byteLength) {
-        // Buffer control con umbrales relajados para red local
         if (dc && dc.bufferedAmount > this.BUFFER_THRESHOLD) {
           await this.waitForBufferDrain(dc);
         }
@@ -69,8 +70,43 @@ export class FileTransferManager {
       }
     }
 
+    // Esperar a que el buffer de envío se drene por completo
+    if (dc) {
+      await this.waitForBufferEmpty(dc);
+    }
+
     // Señal de fin de archivo
     peerConnection.send({ type: 'file-end', payload: { fileId } });
+
+    // Esperar confirmación del receptor
+    if (waitForAck) {
+      await waitForAck();
+    }
+  }
+
+  /**
+   * Espera a que el buffer de envío esté completamente vacío.
+   */
+  static waitForBufferEmpty(dc) {
+    return new Promise((resolve) => {
+      const check = () => {
+        if (!dc || dc.bufferedAmount === 0) {
+          resolve();
+        } else {
+          setTimeout(check, 10);
+        }
+      };
+      if (dc.bufferedAmountLowThreshold !== undefined) {
+        dc.bufferedAmountLowThreshold = 0;
+        dc.onbufferedamountlow = () => {
+          dc.onbufferedamountlow = null;
+          resolve();
+        };
+        setTimeout(check, 50);
+      } else {
+        setTimeout(check, 10);
+      }
+    });
   }
 
   /**

@@ -36,6 +36,19 @@
     <!-- ================================================================
          CABECERA
     ================================================================ -->
+    <!-- Banner de instalación PWA -->
+    <div id="install-banner" class="install-banner hidden">
+      <div class="install-content">
+        <div class="install-icon">📲</div>
+        <div class="install-text">
+          <strong>Instala QDrop</strong>
+          <span>Acceso directo desde tu pantalla de inicio</span>
+        </div>
+        <button id="install-btn" class="btn btn-primary btn-small">Instalar</button>
+        <button id="install-dismiss-btn" class="btn-icon" aria-label="Cerrar">&times;</button>
+      </div>
+    </div>
+
     <header class="app-header">
       <div class="logo-area">
         <svg class="header-logo-icon" viewBox="0 0 512 512" width="36" height="36" aria-hidden="true">
@@ -200,18 +213,20 @@
     ================================================================ -->
     <section id="transfer-screen" class="glass-panel hidden">
 
-      <!-- Cabecera Peer-to-Peer -->
+      <!-- Cabecera de conexión (Mesh) -->
       <div class="connection-header">
-        <div class="peer-user">
+        <div class="peer-user me">
           <div class="user-avatar">💻</div>
           <div class="user-name" id="my-name-label">Tú</div>
         </div>
         <div class="connection-line" aria-hidden="true">
           <span class="pulse-dot"></span>
         </div>
-        <div class="peer-user">
-          <div class="user-avatar">📱</div>
-          <div class="user-name" id="peer-name-label">Par conectado</div>
+        <div class="connection-peers" id="peer-list-container">
+          <div class="peer-user" id="peer-template" style="display:none">
+            <div class="user-avatar">📱</div>
+            <div class="user-name peer-name-label"></div>
+          </div>
         </div>
       </div>
 

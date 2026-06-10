@@ -15,12 +15,15 @@ class QDropApp {
     this._hasActiveTransfer = false;
     this._wakeLockListenerAdded = false;
     this._pendingRoomId = null;
+    this._installPrompt = null;
     this._focusHandler = null;
     this._visibilityHandler = null;
+    this._ackResolve = null;
   }
 
   start() {
     this.registerServiceWorker();
+    this.setupInstallBanner();
     // IMPORTANTE: registrar listeners PRIMERO, luego verificar sesión
     this.setupUIEventListeners();
     this.checkSessionAndInit();
@@ -40,6 +43,60 @@ class QDropApp {
   }
 
   /* -----------------------------------------------------------------------
+     PWA: Banner de instalación
+  ----------------------------------------------------------------------- */
+  setupInstallBanner() {
+    // No mostrar si ya está instalada (standalone o iOS fullscreen)
+    const isStandalone = window.matchMedia('(display-mode: standalone)').matches
+      || window.matchMedia('(display-mode: fullscreen)').matches
+      || ('standalone' in navigator && navigator.standalone);
+    if (isStandalone) return;
+
+    // No mostrar si ya fue descartada en esta sesión
+    if (sessionStorage.getItem('qdrop_install_dismissed')) return;
+
+    const banner = document.getElementById('install-banner');
+    const installBtn = document.getElementById('install-btn');
+    const dismissBtn = document.getElementById('install-dismiss-btn');
+    if (!banner) return;
+
+    // iOS: no hay beforeinstallprompt, mostrar con instrucciones
+    const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent) && !isStandalone;
+    if (isIOS) {
+      const textEl = banner.querySelector('.install-text span');
+      if (textEl) textEl.textContent = 'Toca Compartir > Agregar a Pantalla de Inicio';
+      banner.classList.remove('hidden');
+      dismissBtn?.addEventListener('click', () => {
+        banner.classList.add('hidden');
+        sessionStorage.setItem('qdrop_install_dismissed', '1');
+      });
+      return;
+    }
+
+    // Android Chrome: escuchar beforeinstallprompt
+    window.addEventListener('beforeinstallprompt', (e) => {
+      e.preventDefault();
+      this._installPrompt = e;
+      banner.classList.remove('hidden');
+    });
+
+    installBtn?.addEventListener('click', async () => {
+      if (!this._installPrompt) return;
+      this._installPrompt.prompt();
+      const result = await this._installPrompt.userChoice;
+      if (result.outcome === 'accepted') {
+        banner.classList.add('hidden');
+        this._installPrompt = null;
+      }
+    });
+
+    dismissBtn?.addEventListener('click', () => {
+      banner.classList.add('hidden');
+      sessionStorage.setItem('qdrop_install_dismissed', '1');
+    });
+  }
+
+  /* -----------------------------------------------------------------------
      Sesión de alias con persistencia de 24h en localStorage
   ----------------------------------------------------------------------- */
   checkSessionAndInit() {
@@ -55,7 +112,16 @@ class QDropApp {
           this.localUsername = session.username;
           session.expiresAt = Date.now() + 24 * 60 * 60 * 1000;
           localStorage.setItem('qdrop_user', JSON.stringify(session));
-          // Sesión vigente → ir al lobby directamente
+
+          // Si hay sala pendiente (vía QR o URL), unirse directamente
+          if (this._pendingRoomId) {
+            this.roomId = this._pendingRoomId;
+            this._pendingRoomId = null;
+            this.initializePeer();
+            return;
+          }
+
+          // Sesión vigente sin sala → ir al lobby
           UIManager.showScreen('lobby-screen');
           this._autoShowJoinSection();
           return;
@@ -241,32 +307,38 @@ class QDropApp {
         }
       },
 
-      onPeerConnected: (peerUsername) => {
+      onPeerConnected: (peerId, peerUsername) => {
         UIManager.showScreen('transfer-screen');
         UIManager.showNotification(`¡Conectado con ${peerUsername}!`, 'success');
         this.peerManager?.startKeepalive();
-        this.requestWakeLock(); // Mantener pantalla activa desde la conexión
+        this.requestWakeLock();
         this.requestNotificationPermission();
         this._setupConnectionKeepalive();
-
-        const myNameLabel = document.getElementById('my-name-label');
-        const peerNameLabel = document.getElementById('peer-name-label');
-        if (myNameLabel) myNameLabel.textContent = `${this.localUsername} (Tú)`;
-        if (peerNameLabel) peerNameLabel.textContent = peerUsername;
+        this._updatePeerList();
       },
 
-      onPeerDisconnected: () => {
-        this.peerManager?.stopKeepalive();
-        this.setTransferActive(false);
-        this._removeConnectionKeepalive();
-        UIManager.showNotification('El otro usuario se desconectó. Volviendo al inicio...', 'info');
-        setTimeout(() => {
-          window.location.href = window.location.pathname;
-        }, 3000);
+      onPeerDisconnected: (peerId) => {
+        this._updatePeerList();
+        if (this.peerManager?.isConnected()) {
+          UIManager.showNotification('Un usuario se desconectó.', 'info');
+        } else {
+          this.peerManager?.stopKeepalive();
+          this.setTransferActive(false);
+          this._removeConnectionKeepalive();
+          this.releaseWakeLock();
+          UIManager.showNotification('No quedan usuarios conectados. Volviendo al inicio...', 'info');
+          setTimeout(() => {
+            window.location.href = window.location.pathname;
+          }, 3000);
+        }
       },
 
-      onDataReceived: (data) => {
-        this.handleDataReceived(data);
+      onDataReceived: (data, peerId) => {
+        this.handleDataReceived(data, peerId);
+      },
+
+      onPeersUpdated: () => {
+        this._updatePeerList();
       },
 
       onError: (err) => {
@@ -289,12 +361,12 @@ class QDropApp {
       UIManager.showNotification('Ya hay una transferencia en curso. Espera a que termine.', 'info');
       return;
     }
-    if (!this.peerManager?.isConnected()) {
+    const peers = this.peerManager?.getPeers() || [];
+    if (peers.length === 0) {
       UIManager.showNotification('No hay ninguna conexión activa.', 'error');
       return;
     }
 
-    const conn = this.peerManager.getActiveConnection();
     const dropZone = document.getElementById('drop-zone');
     this._isSending = true;
     this.setTransferActive(true);
@@ -303,10 +375,24 @@ class QDropApp {
     try {
       UIManager.updateProgressBar(0, file.name, 0, false);
 
-      await FileTransferManager.sendFile(file, conn, (bytesSent, totalBytes, speedMbps) => {
-        const percent = (bytesSent / totalBytes) * 100;
-        UIManager.updateProgressBar(percent, file.name, speedMbps, false);
-      });
+      // Enviar a todos los peers conectados (broadcast)
+      this._ackResolve = null;
+      const ackPromises = [];
+
+      for (const peer of peers) {
+        const conn = this.peerManager.getConnection(peer.peerId);
+        if (!conn) continue;
+
+        const ackPromise = new Promise((resolve) => {
+          this._ackResolve = resolve; // Se resuelve al recibir cada file-ack
+        });
+        ackPromises.push(ackPromise);
+
+        await FileTransferManager.sendFile(file, conn, (bytesSent, totalBytes, speedMbps) => {
+          const percent = (bytesSent / totalBytes) * 100;
+          UIManager.updateProgressBar(percent, file.name, speedMbps, false);
+        }, () => ackPromise);
+      }
 
       UIManager.showNotification('¡Archivo enviado con éxito!', 'success');
       UIManager.appendCompletedTransfer(file.name, file.size, null, false);
@@ -326,9 +412,8 @@ class QDropApp {
   /* -----------------------------------------------------------------------
      Recepción de datos (binarios de control y chunks de archivos)
   ----------------------------------------------------------------------- */
-  handleDataReceived(data) {
+  handleDataReceived(data, peerId) {
     if (data instanceof ArrayBuffer) {
-      // Fragmento binario del archivo
       const result = this.fileTransferManager.appendChunk(data, (bytesRx, totalBytes, speedMbps) => {
         const percent = (bytesRx / totalBytes) * 100;
         const name = this.fileTransferManager.currentMeta?.fileName ?? 'Archivo';
@@ -341,16 +426,25 @@ class QDropApp {
         UIManager.appendCompletedTransfer(result.meta.fileName, result.meta.fileSize, result.blob, true);
         this.triggerHapticAndNotification(result.meta.fileName);
         this.setTransferActive(false);
+
+        // Enviar ACK al remitente específico
+        if (peerId) {
+          this.peerManager?.sendTo(peerId, { type: 'file-ack', payload: { fileId: result.meta.fileId } });
+        }
       }
       return;
     }
 
-    // Mensajes de control JSON
     if (data && typeof data === 'object') {
       if (data.type === 'file-meta') {
         this.fileTransferManager.startReceiving(data.payload);
         UIManager.updateProgressBar(0, data.payload.fileName, 0, true);
         this.setTransferActive(true);
+      } else if (data.type === 'file-ack') {
+        if (this._ackResolve) {
+          this._ackResolve();
+          this._ackResolve = null;
+        }
       }
     }
   }
@@ -457,6 +551,44 @@ class QDropApp {
     if (this._visibilityHandler) {
       document.removeEventListener('visibilitychange', this._visibilityHandler);
       this._visibilityHandler = null;
+    }
+  }
+
+  _updatePeerList() {
+    const container = document.getElementById('peer-list-container');
+    if (!container) return;
+
+    const myLabel = document.getElementById('my-name-label');
+    if (myLabel) myLabel.textContent = `${this.localUsername} (Tú)`;
+
+    const peers = this.peerManager?.getPeers() || [];
+
+    // Limpiar peers anteriores (mantener solo el template)
+    let template = document.getElementById('peer-template');
+    if (!template) {
+      template = container.querySelector('.peer-user');
+    }
+    container.querySelectorAll('.peer-user:not(.me)').forEach(el => {
+      if (el.id !== 'peer-template') el.remove();
+    });
+
+    if (peers.length === 0) {
+      // Mostrar "Esperando peers..." o dejar la plantilla oculta
+      return;
+    }
+
+    for (const peer of peers) {
+      // Verificar si ya existe
+      if (container.querySelector(`[data-peer-id="${peer.peerId}"]`)) continue;
+
+      const el = document.createElement('div');
+      el.className = 'peer-user';
+      el.dataset.peerId = peer.peerId;
+      el.innerHTML = `
+        <div class="user-avatar">📱</div>
+        <div class="user-name">${peer.username}</div>
+      `;
+      container.appendChild(el);
     }
   }
 
@@ -574,7 +706,14 @@ class QDropApp {
                   if (hint) hint.textContent = '✅ ¡Código detectado!';
                   if ('vibrate' in navigator) navigator.vibrate(50);
                   this.stopQRScanner();
-                  window.location.href = url.pathname + '?room=' + room;
+                  if (this.localUsername) {
+                    // Ya logueado: unirse directamente a la sala
+                    this.roomId = room;
+                    this.initializePeer();
+                  } else {
+                    // Sin sesión: ir al login con la sala en la URL
+                    window.location.href = url.pathname + '?room=' + room;
+                  }
                   return;
                 } else {
                   if (hint) hint.textContent = '⚠️ Este QR no es de una sala QDrop';

@@ -1,26 +1,30 @@
 export class PeerManager {
   constructor(localUsername) {
     this.peer = null;
-    this.connection = null;
-    this.isHost = false;
+    this.localPeerId = '';
+    this.isCoordinator = false;
+    this.coordinatorId = '';
     this.roomId = '';
     this.localUsername = localUsername;
-    this.peerUsername = '';
+    this.peers = new Map(); // peerId → { conn, username }
     this._events = null;
     this._keepaliveInterval = null;
     this._keepaliveWorker = null;
+    this._connecting = new Set(); // peerIds we're currently connecting to
   }
 
   /**
-   * Inicializa el par local y maneja el rol de Host o Invitado según la URL.
+   * Inicializa el nodo. El primero en crear la sala es el coordinador
+   * (ID fijo "qdrop-{roomId}"). Los demás se conectan al coordinador
+   * y luego establecen enlaces directos con cada nodo existente.
    */
-  initialize(roomIdFromUrl, events) {
+  initialize(roomId, events) {
     this._events = events;
 
-    if (roomIdFromUrl) {
-      // Rol: Invitado (Guest)
-      this.isHost = false;
-      this.roomId = roomIdFromUrl;
+    if (roomId) {
+      this.isCoordinator = false;
+      this.roomId = roomId;
+      this.coordinatorId = `qdrop-${roomId}`;
       this.peer = new Peer(undefined, {
         debug: 1,
         config: {
@@ -31,10 +35,10 @@ export class PeerManager {
         }
       });
     } else {
-      // Rol: Creador de la Sala (Host)
-      this.isHost = true;
+      this.isCoordinator = true;
       this.roomId = Math.random().toString(36).substring(2, 8).toUpperCase();
-      this.peer = new Peer(`${this.roomId}-host`, {
+      this.coordinatorId = `qdrop-${this.roomId}`;
+      this.peer = new Peer(this.coordinatorId, {
         debug: 1,
         config: {
           iceServers: [
@@ -46,205 +50,316 @@ export class PeerManager {
     }
 
     this.peer.on('open', (id) => {
-      console.log('PeerJS conectado con ID:', id);
-      events.onLocalIdReady(this.roomId, this.isHost);
-      if (!this.isHost) {
-        // Pequeño delay para que el servidor PeerJS propague el host
-        setTimeout(() => this.connectToHost(events), 500);
+      this.localPeerId = id;
+      console.log('[Mesh] PeerJS conectado. ID:', id, '| Coordinador?', this.isCoordinator);
+      events.onLocalIdReady(this.roomId, this.isCoordinator);
+
+      if (!this.isCoordinator) {
+        setTimeout(() => this.connectToCoordinator(), 500);
       }
     });
 
-    // El Host escucha conexiones entrantes
+    // El coordinador acepta conexiones de nuevos peers
+    // Los peers existentes también aceptan conexiones directas de otros peers
     this.peer.on('connection', (conn) => {
-      if (this.isHost && !this.connection) {
-        this.connection = conn;
-        this.setupConnectionHandlers(events);
-      } else {
-        // Rechazar conexiones adicionales
-        conn.close();
-      }
+      this.setupPeerConnection(conn, null);
     });
 
     this.peer.on('disconnected', () => {
-      console.warn('Desconectado del servidor PeerJS. Intentando reconectar...');
+      console.warn('[Mesh] Desconectado del servidor PeerJS. Reconectando...');
       this.peer.reconnect();
     });
 
     this.peer.on('error', (err) => {
-      console.error('Error de PeerJS:', err.type, err.message);
+      console.error('[Mesh] Error PeerJS:', err.type, err.message);
       events.onError(err);
     });
   }
 
   /**
-   * Conecta al host de la sala (rol de Invitado).
+   * El invitado se conecta al coordinador.
    */
-  connectToHost(events) {
-    const hostId = `${this.roomId}-host`;
-    console.log('Intentando conectar al host:', hostId);
-    this.connection = this.peer.connect(hostId, {
+  connectToCoordinator() {
+    console.log('[Mesh] Conectando al coordinador:', this.coordinatorId);
+    const conn = this.peer.connect(this.coordinatorId, {
       reliable: true,
       serialization: 'binary'
     });
-    this.setupConnectionHandlers(events);
+    this.setupPeerConnection(conn, this.coordinatorId);
   }
 
   /**
-   * Configura los eventos del canal de datos abierto.
+   * Configura los handlers para una conexión entrante o saliente.
+   * @param {Object} conn - Conexión PeerJS
+   * @param {string|null} expectedPeerId - Si es saliente, el ID esperado
    */
-  setupConnectionHandlers(events) {
-    this.connection.on('open', () => {
-      console.log('Canal de datos abierto.');
-      // Enviar nombre de usuario como primer mensaje de control
-      this.connection.send({
-        type: 'username',
-        payload: { username: this.localUsername }
-      });
-      // Iniciar keepalive para mantener la conexión activa
+  setupPeerConnection(conn, expectedPeerId) {
+    const peerId = expectedPeerId || conn.peer;
+
+    conn.on('open', () => {
+      console.log('[Mesh] Canal abierto con:', peerId);
+
+      // Si es conexión con el coordinador, presentarnos
+      if (peerId === this.coordinatorId && !this.isCoordinator) {
+        conn.send({ type: 'username', payload: { username: this.localUsername, peerId: this.localPeerId } });
+      }
+
       this.startKeepalive();
     });
 
-    this.connection.on('data', async (raw) => {
+    conn.on('data', async (raw) => {
       let data = raw;
 
-      // Normalizar Blob a ArrayBuffer
       if (raw instanceof Blob) {
         data = await raw.arrayBuffer();
       }
 
-      // Detectar datos binarios (ArrayBuffer, Uint8Array, TypedArrays)
-      // PeerJS con serialization:'binary' entrega Uint8Array, NO ArrayBuffer
       if (data && typeof data.byteLength === 'number' && data.byteLength > 0) {
-        // Normalizar a ArrayBuffer
         if (!(data instanceof ArrayBuffer)) {
           const buf = data.buffer;
           data = buf.slice(data.byteOffset, data.byteOffset + data.byteLength);
         }
-
-        // Pequeño: podría ser un mensaje de control serializado como binario
         if (data.byteLength < 2048) {
           try {
             const text = new TextDecoder().decode(data);
-            const parsed = JSON.parse(text);
-            data = parsed;
+            data = JSON.parse(text);
           } catch {
-            events.onDataReceived(data);
+            this._events.onDataReceived(data, peerId);
             return;
           }
         } else {
-          events.onDataReceived(data);
+          this._events.onDataReceived(data, peerId);
           return;
         }
       }
 
-      // Normalizar string JSON a objeto
       if (typeof data === 'string') {
         try {
           data = JSON.parse(data);
         } catch {
-          events.onDataReceived(data);
+          this._events.onDataReceived(data, peerId);
           return;
         }
       }
 
-      // Aquí data debería ser un objeto (mensaje de control)
       if (data && typeof data === 'object') {
         if (data.type === 'username') {
-          this.peerUsername = data.payload.username;
-          events.onPeerConnected(this.peerUsername);
+          const username = data.payload.username;
+          const incomingPeerId = data.payload.peerId || peerId;
+
+          // Almacenar o actualizar en peers
+          if (!this.peers.has(incomingPeerId)) {
+            this.peers.set(incomingPeerId, { conn, username });
+          } else {
+            const existing = this.peers.get(incomingPeerId);
+            existing.conn = conn;
+            existing.username = username;
+          }
+
+          console.log(`[Mesh] Peer conectado: ${username} (${incomingPeerId})`);
+
+          // Si soy el coordinador, enviar lista de peers al recién llegado
+          // y notificar a los demás
+          if (this.isCoordinator) {
+            this._syncNewPeer(incomingPeerId, username);
+          }
+
+          this._events.onPeerConnected(incomingPeerId, username);
+          this._events.onPeersUpdated?.(this.getPeers());
+        } else if (data.type === 'peer-list') {
+          // Recibimos la lista de peers existentes del coordinador
+          const peerList = data.payload.peers; // [{ peerId, username }]
+          console.log('[Mesh] Lista de peers recibida:', peerList);
+          for (const p of peerList) {
+            if (p.peerId !== this.localPeerId && !this.peers.has(p.peerId) && !this._connecting.has(p.peerId)) {
+              this.connectToPeer(p.peerId, p.username);
+            }
+          }
+        } else if (data.type === 'peer-joined') {
+          // Otro peer se unió (broadcast del coordinador)
+          const p = data.payload;
+          if (p.peerId !== this.localPeerId && !this.peers.has(p.peerId) && !this._connecting.has(p.peerId)) {
+            this.connectToPeer(p.peerId, p.username);
+          }
+        } else if (data.type === 'peer-left') {
+          const leftPeerId = data.payload.peerId;
+          console.log('[Mesh] Peer se fue:', leftPeerId);
+          this.peers.delete(leftPeerId);
+          this._events.onPeerDisconnected(leftPeerId);
+          this._events.onPeersUpdated?.(this.getPeers());
         } else if (data.type === 'ping') {
-          // Keepalive: ignora
+          // Keepalive
         } else {
-          events.onDataReceived(data);
+          this._events.onDataReceived(data, peerId);
         }
       } else {
-        events.onDataReceived(data);
+        this._events.onDataReceived(data, peerId);
       }
     });
 
-    this.connection.on('close', () => {
-      console.log('Canal de datos cerrado.');
-      this.stopKeepalive();
-      events.onPeerDisconnected();
+    conn.on('close', () => {
+      console.log('[Mesh] Canal cerrado con:', peerId);
+      if (this.peers.has(peerId)) {
+        this.peers.delete(peerId);
+        this._events.onPeerDisconnected(peerId);
+        this._events.onPeersUpdated?.(this.getPeers());
+      }
+      if (this.peers.size === 0) {
+        this.stopKeepalive();
+      }
     });
 
-    this.connection.on('error', (err) => {
-      console.error('Error en canal de datos:', err);
-      events.onError(err);
+    conn.on('error', (err) => {
+      console.error('[Mesh] Error en canal con', peerId, ':', err);
     });
   }
 
   /**
-   * Envía datos (string JSON o ArrayBuffer) al par conectado.
+   * El coordinador sincroniza al nuevo peer y notifica a los existentes.
    */
-  send(data) {
-    if (this.connection && this.connection.open) {
-      this.connection.send(data);
+  _syncNewPeer(newPeerId, newUsername) {
+    // Enviar lista de peers existentes al nuevo
+    const existingPeers = [];
+    for (const [pid, info] of this.peers) {
+      if (pid !== newPeerId) {
+        existingPeers.push({ peerId: pid, username: info.username });
+      }
+    }
+    const newConn = this.peers.get(newPeerId)?.conn;
+    if (newConn) {
+      newConn.send({ type: 'peer-list', payload: { peers: existingPeers } });
+    }
+
+    // Notificar a los peers existentes que alguien nuevo se unió
+    for (const [pid, info] of this.peers) {
+      if (pid !== newPeerId) {
+        info.conn.send({ type: 'peer-joined', payload: { peerId: newPeerId, username: newUsername } });
+      }
+    }
+  }
+
+  /**
+   * Conecta directamente a otro peer (establece enlace de malla).
+   */
+  connectToPeer(peerId, username) {
+    if (this._connecting.has(peerId) || this.peers.has(peerId)) return;
+    this._connecting.add(peerId);
+
+    console.log(`[Mesh] Conectando directamente a ${username} (${peerId})...`);
+    const conn = this.peer.connect(peerId, {
+      reliable: true,
+      serialization: 'binary'
+    });
+
+    conn.on('open', () => {
+      this._connecting.delete(peerId);
+      // Presentarnos a este peer
+      conn.send({ type: 'username', payload: { username: this.localUsername, peerId: this.localPeerId } });
+    });
+
+    conn.on('close', () => {
+      this._connecting.delete(peerId);
+    });
+
+    this.setupPeerConnection(conn, peerId);
+  }
+
+  /**
+   * Envía datos a todos los peers conectados.
+   */
+  broadcast(data) {
+    for (const [, info] of this.peers) {
+      if (info.conn && info.conn.open) {
+        info.conn.send(data);
+      }
+    }
+  }
+
+  /**
+   * Envía datos a un peer específico.
+   */
+  sendTo(peerId, data) {
+    const info = this.peers.get(peerId);
+    if (info && info.conn && info.conn.open) {
+      info.conn.send(data);
       return true;
     }
     return false;
   }
 
   /**
-   * Verifica si la conexión está activa y lista.
+   * Retorna la lista de peers conectados: [{ peerId, username }]
+   */
+  getPeers() {
+    const list = [];
+    for (const [peerId, info] of this.peers) {
+      list.push({ peerId, username: info.username });
+    }
+    return list;
+  }
+
+  /**
+   * Retorna true si hay al menos un peer conectado.
    */
   isConnected() {
-    return this.connection && this.connection.open;
+    return this.peers.size > 0;
   }
 
   /**
-   * Obtiene la conexión activa del canal de datos.
+   * Retorna la primera conexión activa (compatibilidad con código anterior).
    */
   getActiveConnection() {
-    return this.connection;
+    for (const [, info] of this.peers) {
+      if (info.conn && info.conn.open) return info.conn;
+    }
+    return null;
   }
 
   /**
-   * Obtiene el nombre del par conectado.
+   * Retorna la conexión a un peer específico.
    */
+  getConnection(peerId) {
+    const info = this.peers.get(peerId);
+    return (info && info.conn && info.conn.open) ? info.conn : null;
+  }
+
+  /**
+   * Retorna la primera conexión cuyo peer tenga el nombre indicado.
+   */
+  getConnectionByUsername(username) {
+    for (const [, info] of this.peers) {
+      if (info.username === username && info.conn && info.conn.open) return info.conn;
+    }
+    return null;
+  }
+
   getPeerUsername() {
-    return this.peerUsername;
+    for (const [, info] of this.peers) {
+      return info.username;
+    }
+    return '';
   }
 
-  /**
-   * Inicia el envío periódico de pings vía Web Worker.
-   * El Worker no es frenado por el navegador aunque el tab esté en segundo plano
-   * (ej. al abrir el selector de archivos en el celular).
-   */
   startKeepalive() {
-    this.stopKeepalive();
+    if (this._keepaliveWorker) return;
 
-    // Si el Worker ya existe, reciclarlo
-    if (!this._keepaliveWorker) {
-      try {
-        this._keepaliveWorker = new Worker('./js/keepalive-worker.js');
-        this._keepaliveWorker.onmessage = () => {
-          if (this.connection && this.connection.open) {
-            this.connection.send({ type: 'ping' });
-          } else {
-            this.stopKeepalive();
-          }
-        };
-      } catch (err) {
-        // Fallback a setInterval si no soporta Workers
-        console.warn('[Keepalive] Workers no soportado, usando setInterval:', err.message);
-        this._keepaliveInterval = setInterval(() => {
-          if (this.connection && this.connection.open) {
-            this.connection.send({ type: 'ping' });
-          } else {
-            this.stopKeepalive();
-          }
-        }, 5000);
-        return;
-      }
+    try {
+      this._keepaliveWorker = new Worker('./js/keepalive-worker.js');
+      this._keepaliveWorker.onmessage = () => {
+        this.broadcast({ type: 'ping' });
+        if (this.peers.size === 0) this.stopKeepalive();
+      };
+    } catch (err) {
+      this._keepaliveInterval = setInterval(() => {
+        this.broadcast({ type: 'ping' });
+        if (this.peers.size === 0) this.stopKeepalive();
+      }, 5000);
+      return;
     }
 
     this._keepaliveWorker.postMessage({ type: 'start', interval: 5000 });
   }
 
-  /**
-   * Detiene los pings de keepalive.
-   */
   stopKeepalive() {
     if (this._keepaliveWorker) {
       this._keepaliveWorker.postMessage({ type: 'stop' });
@@ -255,22 +370,19 @@ export class PeerManager {
     }
   }
 
-  /**
-   * Desconecta de la sala de forma limpia.
-   */
   disconnect() {
     this.stopKeepalive();
-    if (this.connection) {
-      this.connection.close();
-      this.connection = null;
+    for (const [, info] of this.peers) {
+      if (info.conn) info.conn.close();
+    }
+    this.peers.clear();
+    if (this._keepaliveWorker) {
+      this._keepaliveWorker.terminate();
+      this._keepaliveWorker = null;
     }
     if (this.peer) {
       this.peer.destroy();
       this.peer = null;
-    }
-    if (this._keepaliveWorker) {
-      this._keepaliveWorker.terminate();
-      this._keepaliveWorker = null;
     }
   }
 }
