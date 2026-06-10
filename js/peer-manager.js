@@ -218,6 +218,13 @@ export class PeerManager {
    * El coordinador sincroniza al nuevo peer y notifica a los existentes.
    */
   _syncNewPeer(newPeerId, newUsername) {
+    const newConn = this.peers.get(newPeerId)?.conn;
+    if (!newConn) return;
+
+    // El coordinador se presenta al nuevo peer (así el invitado
+    // lo agrega a this.peers y puede enviarle archivos)
+    newConn.send({ type: 'username', payload: { username: this.localUsername, peerId: this.coordinatorId } });
+
     // Enviar lista de peers existentes al nuevo
     const existingPeers = [];
     for (const [pid, info] of this.peers) {
@@ -225,10 +232,7 @@ export class PeerManager {
         existingPeers.push({ peerId: pid, username: info.username });
       }
     }
-    const newConn = this.peers.get(newPeerId)?.conn;
-    if (newConn) {
-      newConn.send({ type: 'peer-list', payload: { peers: existingPeers } });
-    }
+    newConn.send({ type: 'peer-list', payload: { peers: existingPeers } });
 
     // Notificar a los peers existentes que alguien nuevo se unió
     for (const [pid, info] of this.peers) {

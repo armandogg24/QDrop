@@ -529,11 +529,12 @@ class QDropApp {
 
     this._visibilityHandler = () => {
       if (document.visibilityState === 'visible') {
-        // Enviar ráfaga de pings al volver para refrescar ICE
         if (this.peerManager?.isConnected()) {
           const conn = this.peerManager.getActiveConnection();
-          for (let i = 0; i < 3; i++) {
-            conn.send({ type: 'ping' });
+          if (conn) {
+            for (let i = 0; i < 3; i++) {
+              conn.send({ type: 'ping' });
+            }
           }
         }
       }

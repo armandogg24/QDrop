@@ -1,4 +1,4 @@
-const CACHE_NAME = 'qdrop-v1';
+const CACHE_NAME = 'qdrop-v2';
 const ASSETS = [
   './',
   './index.html',
