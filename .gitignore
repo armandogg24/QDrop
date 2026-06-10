@@ -1,0 +1,15 @@
+# TypeScript fuente
+src/
+
+# Documentación interna
+architecture/
+*.md
+!README.md
+!LICENSE.md
+
+# Temporales
+.tmp/
+
+# OS
+.DS_Store
+Thumbs.db

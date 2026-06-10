@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>QDrop – Transferencia P2P Multiplataforma</title>
+  <meta name="description" content="Comparte archivos directamente entre cualquier dispositivo (PC, móvil, tablet, reloj, TV) de forma rápida y privada. Sin servidores intermediarios.">
+
+  <!-- PWA -->
+  <link rel="manifest" href="./manifest.json">
+  <meta name="theme-color" content="#0b0f19">
+  <link rel="icon" type="image/svg+xml" href="./assets/icons/icon.svg">
+
+  <!-- Apple / iOS -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="QDrop">
+  <link rel="apple-touch-icon" href="./assets/icons/icon.svg">
+
+  <!-- Tipografía -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
+
+  <!-- PeerJS, QRious y jsQR desde CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/qrious@4.0.2/dist/qrious.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+
+  <div id="app-container">
+
+    <!-- ================================================================
+         CABECERA
+    ================================================================ -->
+    <header class="app-header">
+      <div class="logo-area">
+        <svg class="header-logo-icon" viewBox="0 0 512 512" width="36" height="36" aria-hidden="true">
+          <defs>
+            <linearGradient id="hg" x1="0%" y1="0%" x2="100%" y2="100%">
+              <stop offset="0%" stop-color="#8b5cf6"/>
+              <stop offset="100%" stop-color="#06b6d4"/>
+            </linearGradient>
+          </defs>
+          <circle cx="256" cy="256" r="220" fill="none" stroke="url(#hg)" stroke-width="28" stroke-dasharray="18 38"/>
+          <path d="M256,110 L256,330 M196,268 L256,330 L316,268" fill="none" stroke="url(#hg)" stroke-width="36" stroke-linecap="round" stroke-linejoin="round"/>
+          <path d="M155,395 Q256,440 357,395" fill="none" stroke="url(#hg)" stroke-width="24" stroke-linecap="round"/>
+        </svg>
+        <h1 class="logo-title">Q<span>Drop</span></h1>
+      </div>
+      <span class="status-badge">P2P · WebRTC</span>
+    </header>
+
+    <!-- ================================================================
+         PANTALLA 1: Login / Alias
+    ================================================================ -->
+    <section id="login-screen" class="glass-panel text-center">
+      <div class="screen-icon">🚀</div>
+      <h2>Bienvenido a QDrop</h2>
+      <p class="subtitle">
+        Ingresa un nombre para identificarte en la sala. Lo recordaremos durante 24 horas.
+      </p>
+      <form id="login-form" class="form-container" autocomplete="off">
+        <div class="input-group">
+          <input
+            type="text"
+            id="username-input"
+            placeholder="Tu nombre o apodo..."
+            maxlength="24"
+            required
+            autocomplete="off"
+            spellcheck="false"
+          >
+        </div>
+        <button type="submit" id="login-btn" class="btn btn-primary btn-block">
+          Entrar a la sala
+        </button>
+      </form>
+      <div class="divider-row">
+        <span class="divider-line"></span>
+        <span class="divider-text">o</span>
+        <span class="divider-line"></span>
+      </div>
+      <button type="button" id="scan-qr-btn" class="btn btn-secondary btn-block">
+        📷 Escanear código QR
+      </button>
+      <p class="privacy-note">🔒 Los archivos van directamente de dispositivo a dispositivo. Nunca pasan por ningún servidor.</p>
+    </section>
+
+    <!-- Scanner QR Overlay -->
+    <div id="scanner-overlay" class="scanner-overlay hidden">
+      <div class="scanner-container">
+        <div class="scanner-header">
+          <h3>Escanear QR</h3>
+          <button id="scanner-close-btn" class="btn-icon" aria-label="Cerrar escáner">&times;</button>
+        </div>
+        <div class="scanner-viewport">
+          <video id="scanner-video" playsinline muted></video>
+          <canvas id="scanner-canvas" hidden></canvas>
+          <div class="scanner-frame"></div>
+          <div class="scanner-line"></div>
+        </div>
+        <p class="scanner-hint" id="scanner-hint">Enfoca el código QR de la sala</p>
+        <button id="scanner-cancel-btn" class="btn btn-secondary btn-block">Cancelar</button>
+      </div>
+    </div>
+
+    <!-- ================================================================
+         PANTALLA 2: Lobby / Opciones
+    ================================================================ -->
+    <section id="lobby-screen" class="glass-panel text-center hidden">
+      <div class="screen-icon">🚀</div>
+      <h2>¿Qué deseas hacer?</h2>
+      <p class="subtitle">Crea una sala para compartir archivos o únete a una existente.</p>
+
+      <div class="lobby-options">
+        <button type="button" id="create-room-btn" class="btn btn-primary btn-block">
+          ➕ Crear sala
+        </button>
+
+        <div class="divider-row">
+          <span class="divider-line"></span>
+          <span class="divider-text">o</span>
+          <span class="divider-line"></span>
+        </div>
+
+        <div id="join-section">
+          <button type="button" id="toggle-join-btn" class="btn btn-secondary btn-block">
+            🔗 Unirse a una sala
+          </button>
+          <div id="join-input-group" class="join-input-group hidden">
+            <div class="input-group">
+              <input
+                type="text"
+                id="room-id-input"
+                placeholder="Ingresa el ID de la sala (ej: ABC123)"
+                maxlength="10"
+                autocomplete="off"
+                spellcheck="false"
+              >
+            </div>
+            <div class="join-actions">
+              <button type="button" id="join-room-btn" class="btn btn-primary btn-block">
+                Unirse
+              </button>
+              <button type="button" id="lobby-scan-qr-btn" class="btn btn-secondary btn-block">
+                📷 Escanear QR
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================================================================
+         PANTALLA 3: Sala / Espera
+    ================================================================ -->
+    <section id="room-screen" class="glass-panel text-center hidden">
+      <h2 id="room-title">Preparando sala...</h2>
+
+      <!-- Animación de ondas de red -->
+      <div class="network-pulse" aria-hidden="true">
+        <div class="pulse-ring ring-1"></div>
+        <div class="pulse-ring ring-2"></div>
+        <div class="pulse-ring ring-3"></div>
+        <div class="pulse-center">📡</div>
+      </div>
+
+      <p class="status-text" id="room-status-text">Conectando con la red P2P...</p>
+
+      <!-- Sección de invitación (solo visible para el Host) -->
+      <div id="invite-section" class="invite-box hidden">
+        <hr class="separator">
+        <h3>Compartir sala</h3>
+        <p class="info-text">
+          Envía este enlace o muestra el código QR para que otra persona se conecte a tu sala.
+        </p>
+
+        <div class="invite-url-container">
+          <input type="text" id="invite-link-input" readonly aria-label="Enlace de invitación">
+          <button class="btn btn-secondary" id="copy-link-btn" title="Copiar enlace">
+            📋 Copiar
+          </button>
+        </div>
+
+        <div class="qr-wrapper">
+          <div class="qr-container">
+            <canvas id="invite-qr-canvas" width="200" height="200"></canvas>
+          </div>
+          <p class="qr-hint">Escanea con tu celular, tablet o reloj</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================================================================
+         PANTALLA 3: Transferencia Activa
+    ================================================================ -->
+    <section id="transfer-screen" class="glass-panel hidden">
+
+      <!-- Cabecera Peer-to-Peer -->
+      <div class="connection-header">
+        <div class="peer-user">
+          <div class="user-avatar">💻</div>
+          <div class="user-name" id="my-name-label">Tú</div>
+        </div>
+        <div class="connection-line" aria-hidden="true">
+          <span class="pulse-dot"></span>
+        </div>
+        <div class="peer-user">
+          <div class="user-avatar">📱</div>
+          <div class="user-name" id="peer-name-label">Par conectado</div>
+        </div>
+      </div>
+
+      <!-- Zona de drag & drop -->
+      <div class="drop-zone" id="drop-zone" role="button" tabindex="0" aria-label="Zona para arrastrar y soltar archivos">
+        <div class="drop-zone-content">
+          <div class="upload-icon">📁</div>
+          <h3>Arrastra tu archivo aquí</h3>
+          <p>o haz clic para seleccionarlo desde tu dispositivo</p>
+          <input type="file" id="file-input" class="visually-hidden" aria-label="Seleccionar archivo">
+        </div>
+      </div>
+
+      <!-- Barra de progreso de transferencia activa -->
+      <div id="progress-container" class="progress-box hidden" aria-live="polite">
+        <div class="progress-header">
+          <span id="progress-file-info" class="progress-file">Preparando...</span>
+          <span id="progress-speed" class="progress-speed">0 Mbps</span>
+        </div>
+        <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100">
+          <div id="progress-bar" class="progress-fill" style="width: 0%;"></div>
+        </div>
+        <div class="progress-footer">
+          <span>Progreso</span>
+          <span id="progress-text">0%</span>
+        </div>
+      </div>
+
+      <!-- Historial de transferencias completadas -->
+      <div class="completed-transfers-section">
+        <h3 class="section-label">Historial de archivos</h3>
+        <div class="completed-list" id="completed-transfers-list">
+          <div class="empty-list-state" id="empty-state-text">
+            Sin transferencias en esta sesión
+          </div>
+        </div>
+      </div>
+
+      <button class="btn btn-danger btn-block" id="leave-room-btn">
+        Salir de la sala
+      </button>
+    </section>
+
+    <!-- ================================================================
+         PANTALLA 4: Error de Conexión
+    ================================================================ -->
+    <section id="error-screen" class="glass-panel text-center hidden">
+      <div class="screen-icon error-icon">⚠️</div>
+      <h2>Error de conexión</h2>
+      <p id="error-message" class="subtitle">
+        No se pudo establecer la conexión P2P.
+      </p>
+      <a href="./" class="btn btn-primary btn-block" id="retry-btn">
+        Volver a intentar
+      </a>
+    </section>
+
+  </div><!-- /#app-container -->
+
+  <!-- Contenedor de notificaciones emergentes -->
+  <div id="notification-container" aria-live="polite" aria-atomic="true"></div>
+
+  <!-- Módulo principal (ES Module) -->
+  <script type="module" src="./js/main.js"></script>
+
+</body>
+</html>
